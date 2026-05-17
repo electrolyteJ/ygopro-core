@@ -16,13 +16,16 @@ workspace "ocgcoredll"
     language "C++"
 
     configurations { "Release", "Debug" }
-    platforms { "x32", "x64" }
-    
+    platforms { "x32", "x64", "arm64" }
+
     filter "platforms:x32"
         architecture "x32"
 
     filter "platforms:x64"
         architecture "x64"
+
+    filter "platforms:arm64"
+        architecture "ARM64"
 
     filter "configurations:Release"
         optimize "Speed"

@@ -6,13 +6,13 @@ concurrency:
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master","feature/*" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master","feature/*" ]
 
 jobs:
-  build-windows:
-    runs-on: windows-2022
+  prepare:
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout
@@ -24,10 +24,31 @@ jobs:
       with:
         url: https://www.lua.org/ftp/lua-5.4.8.tar.gz
 
-    - name: Lua
+    - name: Extract lua
       run: |
         tar -xzf ${{ steps.lua.outputs.filepath }}
-        move lua-5.4.8 lua
+        mv lua-5.4.8 lua
+
+    - name: Upload sources
+      uses: actions/upload-artifact@v6
+      with:
+        name: sources
+        path: |
+          lua/
+          *.cpp
+          *.h
+          premake/
+
+  build-windows:
+    needs: [prepare]
+    runs-on: windows-2022
+
+    steps:
+    - name: Download sources
+      uses: actions/download-artifact@v7
+      with:
+        name: sources
+        path: .
 
     - name: Download premake
       id: premake
@@ -63,27 +84,20 @@ jobs:
           build/bin/x64/Release/ocgcore.dll
 
   build-linux:
+    needs: [prepare]
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v6
+    - name: Download sources
+      uses: actions/download-artifact@v7
+      with:
+        name: sources
+        path: .
 
     - name: Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y gcc-multilib g++-multilib
-
-    - name: Download lua
-      id: lua
-      uses: mercury233/action-cache-download-file@0e2b8bab566270adae95bd3cd298744402b667eb
-      with:
-        url: https://www.lua.org/ftp/lua-5.4.8.tar.gz
-
-    - name: Lua
-      run: |
-        tar -xzf ${{ steps.lua.outputs.filepath }}
-        mv lua-5.4.8 lua
 
     - name: Download premake
       id: premake
@@ -119,3 +133,211 @@ jobs:
         path: |
           build/bin/x32/Release/libocgcore.so
           build/bin/x64/Release/libocgcore.so
+
+  build-macos:
+    needs: [prepare]
+    strategy:
+      fail-fast: false
+      matrix:
+        name:
+          - macos-arm64
+          - macos-x64
+        include:
+          - name: macos-arm64
+            platform: arm64
+          - name: macos-x64
+            platform: x64
+
+    runs-on: macos-latest
+
+    steps:
+    - name: Download sources
+      uses: actions/download-artifact@v7
+      with:
+        name: sources
+        path: .
+
+    - name: Download premake
+      id: premake
+      uses: mercury233/action-cache-download-file@0e2b8bab566270adae95bd3cd298744402b667eb
+      with:
+        url: https://github.com/premake/premake-core/releases/download/v5.0.0-beta7/premake-5.0.0-beta7-macosx.tar.gz
+
+    - name: Premake
+      run: |
+        mkdir premake-5
+        tar -C premake-5 -xzf ${{ steps.premake.outputs.filepath }}
+        cp premake/lua.lua lua/premake5.lua
+        cp premake/dll.lua dll.lua
+        chmod +x premake-5/premake5
+        ./premake-5/premake5 gmake --file=dll.lua
+
+    - name: Build ${{ matrix.platform }}
+      run: |
+        cd build
+        make -j $(sysctl -n hw.logicalcpu) config=release_${{ matrix.platform }}
+        cd ..
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: ocgcore-${{ matrix.name }}
+        path: |
+          build/bin/${{ matrix.platform }}/Release/libocgcore.dylib
+
+  build-android:
+    needs: [prepare]
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a]
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android21
+          - abi: armeabi-v7a
+            target: armv7a-linux-androideabi21
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download sources
+      uses: actions/download-artifact@v7
+      with:
+        name: sources
+        path: .
+
+    - name: Setup Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r27c
+        add-to-path: false
+
+    - name: Build for Android (${{ matrix.abi }})
+      run: |
+        TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64"
+        export CC="$TOOLCHAIN/bin/${{ matrix.target }}-clang"
+        export CXX="$TOOLCHAIN/bin/${{ matrix.target }}-clang++"
+        export AR="$TOOLCHAIN/bin/llvm-ar"
+        TARGET_FLAGS="-target ${{ matrix.target }} -fPIC -O2"
+
+        cd lua
+        mkdir -p obj
+        for f in src/*.c; do
+          base=$(basename "$f" .c)
+          if [ "$base" != "lua" ] && [ "$base" != "luac" ] && [ "$base" != "linit" ] && [ "$base" != "onelua" ]; then
+            $CXX -std=c++11 -Wno-deprecated $TARGET_FLAGS -c "$f" -o "obj/${base}.o"
+          fi
+        done
+        $AR rcs liblua.a obj/*.o
+        cd ..
+
+        mkdir -p obj
+        for f in *.cpp; do
+          base=$(basename "$f" .cpp)
+          $CXX -std=c++14 $TARGET_FLAGS -Ilua/src -DLUA_USE_POSIX -c "$f" -o "obj/${base}.o"
+        done
+        $CXX -shared -fPIC $TARGET_FLAGS -o "libocgcore.so" obj/*.o lua/liblua.a
+
+        mkdir -p "output/${{ matrix.abi }}"
+        mv libocgcore.so "output/${{ matrix.abi }}/"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: ocgcore-android-${{ matrix.abi }}
+        path: output/${{ matrix.abi }}/
+
+  build-ios:
+    needs: [prepare]
+    runs-on: macos-latest
+
+    steps:
+    - name: Download sources
+      uses: actions/download-artifact@v7
+      with:
+        name: sources
+        path: .
+
+    - name: Setup Xcode
+      run: |
+        sudo xcodebuild -license accept
+        sudo xcodebuild -runFirstLaunch
+        # Verify SDKs are available (headers ship with Xcode, no runtime download needed for compilation)
+        xcrun --sdk iphoneos --show-sdk-path > /dev/null
+        xcrun --sdk iphonesimulator --show-sdk-path > /dev/null
+
+    - name: Build all iOS targets and create universal binary
+      run: |
+        set -e
+
+        build_target() {
+          local sdk="$1"
+          local arch="$2"
+          local min_ver_flag="$3"
+          local output="$4"
+
+          SDK_PATH=$(xcrun --sdk "$sdk" --show-sdk-path)
+          CC="xcrun --sdk $sdk clang"
+          CXX="xcrun --sdk $sdk clang++"
+          AR="xcrun --sdk $sdk ar"
+
+          BASE_FLAGS="-arch $arch -isysroot $SDK_PATH $min_ver_flag -O2"
+          CORE_FLAGS="$BASE_FLAGS -std=c++14 -Ilua/src -DLUA_USE_MACOSX"
+          LUA_FLAGS="$BASE_FLAGS -std=c++11 -DLUA_USE_MACOSX -Dl_system(cmd)=(-1) -Wno-deprecated"
+
+          # Build lua
+          cd lua
+          rm -rf obj
+          mkdir -p obj
+          for f in src/*.c; do
+            base=$(basename "$f" .c)
+            if [ "$base" != "lua" ] && [ "$base" != "luac" ] && [ "$base" != "linit" ] && [ "$base" != "onelua" ]; then
+              $CXX $LUA_FLAGS -c "$f" -o "obj/${base}.o"
+            fi
+          done
+          $AR rcs liblua.a obj/*.o
+          cd ..
+
+          # Build ocgcore
+          rm -rf obj
+          mkdir -p obj
+          for f in *.cpp; do
+            base=$(basename "$f" .cpp)
+            $CXX $CORE_FLAGS -c "$f" -o "obj/${base}.o"
+          done
+          $CXX -dynamiclib $BASE_FLAGS -o "$output" obj/*.o lua/liblua.a
+        }
+
+        touch *.cpp lua/src/*.c
+
+        # 1. Device: arm64
+        build_target "iphoneos" "arm64" \
+          "-miphoneos-version-min=12.0" \
+          "libocgcore-device-arm64.dylib"
+
+        # 2. Simulator: x86_64 (Intel Mac)
+        build_target "iphonesimulator" "x86_64" \
+          "-mios-simulator-version-min=12.0" \
+          "libocgcore-simulator-x86_64.dylib"
+
+        # 3. Simulator: arm64 (Apple Silicon Mac)
+        build_target "iphonesimulator" "arm64" \
+          "-mios-simulator-version-min=12.0" \
+          "libocgcore-simulator-arm64.dylib"
+
+        # Create universal binaries with lipo
+        mkdir -p output
+        lipo -create libocgcore-simulator-x86_64.dylib libocgcore-simulator-arm64.dylib \
+          -output output/libocgcore-simulator.dylib
+        cp libocgcore-device-arm64.dylib output/
+        xcodebuild -create-xcframework \
+          -library libocgcore-device-arm64.dylib \
+          -library output/libocgcore-simulator.dylib \
+          -output output/libocgcore.xcframework
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: ocgcore-ios
+        path: output/
