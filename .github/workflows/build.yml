@@ -38,7 +38,7 @@ jobs:
           *.cpp
           *.h
           premake/
-
+          CMakeLists.txt
   build-windows:
     needs: [prepare]
     runs-on: windows-2022
